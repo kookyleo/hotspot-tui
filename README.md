@@ -1,11 +1,30 @@
 # hotspot-tui
 
-Phone-style **personal hotspot** TUI for Linux laptops (built for a ThinkPad
-X1 Carbon: iwlwifi AX211 + Quectel EM05-CE WWAN, NetworkManager, Hyprland).
+A **role switcher** for one WiFi radio — Linux take on the phone
+"personal hotspot".
 
-Press `s`: disconnect WiFi, bring up a 2.4GHz WPA2 AP (`hostapd` on a
-dedicated `__ap` interface), serve DHCP (`dnsmasq`), NAT through the
-cellular default route. Press `x`: tear it all down and restore WiFi.
+Built for a ThinkPad X1 Carbon: iwlwifi AX211 + Quectel EM05-CE WWAN,
+NetworkManager, UFW, Hyprland.
+
+## Mental model
+
+One radio wears exactly **one hat at a time** (firmware: with an AP
+present, every virtual interface must share a single channel — so
+"keep the uplink WiFi and relay it" is a half-bandwidth pseudo-feature
+and pointless when you already have WiFi; the useful move is to
+*switch roles*):
+
+```
+   CLIENT hat                    BASE STATION hat
+ laptop ─⌁─ lap2.4 ⇝ internet    phone ─⌁─ X1C(ap0) ─NAT─ SIM ⇝ internet
+        press x  ◄──────────────►  press s
+```
+
+Press `s`: release the phy from NetworkManager, reset the wifi driver
+(clears leaked firmware state), bring up a 2.4GHz WPA2 AP (`hostapd`),
+serve DHCP (`dnsmasq`), open UFW route/input rules, NAT through the
+cellular route. Press `x`: silence the radio, restore WiFi — the
+client hat goes back on.
 
 > ⚠️ Prototype. Requires passwordless `sudo` for `ip/iptables/iw/hostapd/dnsmasq`
 > and is tuned to *this* machine (interface discovery is best-effort; SSID

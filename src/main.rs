@@ -77,20 +77,20 @@ fn push(ctx: &mut Ctx, s: impl Into<String>) { ctx.log.push(s.into()); }
 fn on_tasks() -> Vec<Task> {
     let mut t: Vec<Task> = Vec::new();
     t.push(Box::new(|c| {
-        push(c, format!("→ releasing WiFi ({}) from NetworkManager…", wifi_dev()));
+        push(c, format!("→ role: client ⇒ BASE STATION · releasing phy ({}) from NM…", wifi_dev()));
         let _ = run("nmcli connection down hotspot 2>/dev/null");
         let wlan = wifi_dev();
         let _ = run(&format!("nmcli device set {wlan} managed no"));
     }));
     t.push(Box::new(|c| {
-        push(c, "· waiting for supplicant cleanup (1.5s)…");
+        push(c, "· supplicant cleanup…");
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }));
     // Firmware-level reset: iwlmvm leaks the AP context on teardown
     // ("Match already configured" on every later start); only a driver
     // reload clears it. rfkill cycling is NOT enough.
     t.push(Box::new(|c| {
-        push(c, "→ resetting wifi driver (clears iwlmvm AP context)…");
+        push(c, "→ ⌁ driver reset (clears iwlmvm AP context)…");
         let _ = run("nmcli radio wifi off");
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let _ = run("sudo modprobe -r iwlmvm iwlwifi 2>/dev/null || sudo rmmod iwlmvm iwlwifi 2>/dev/null || true");
@@ -102,7 +102,7 @@ fn on_tasks() -> Vec<Task> {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }));
     t.push(Box::new(|c| {
-        push(c, "→ creating AP interface ap0…");
+        push(c, "→ creating ap0 (base-station hat)…");
         if !ap_exists() {
             let (ok, out) = run(&format!("sudo iw dev {} interface add ap0 type __ap", wifi_dev()));
             if !ok { push(c, format!("✗ ap0: {}", out.trim())); c.fail = true; return; }
@@ -119,7 +119,7 @@ fn on_tasks() -> Vec<Task> {
     for i in 1..=4u8 {
         t.push(Box::new(move |c| {
             if hostapd_running() { return; }
-            push(c, format!("→ starting hostapd (2.4GHz ch{CHANNEL}, ssid {SSID})… attempt {i}"));
+            push(c, format!("→ ⌁ broadcasting X1C on ch{CHANNEL}… attempt {i}"));
             let (_, out) = run(&format!("sudo hostapd -B -P {}/hostapd.pid {}/hostapd.conf", state_dir().display(), state_dir().display()));
             std::thread::sleep(std::time::Duration::from_millis(1200));
             if !hostapd_running() {
@@ -129,7 +129,7 @@ fn on_tasks() -> Vec<Task> {
                 let _ = run("sudo pkill -f 'hostapd .*hotspot/hostapd.conf' 2>/dev/null");
                 std::thread::sleep(std::time::Duration::from_millis(1500));
             } else {
-                push(c, "✓ hostapd up");
+                push(c, "✓ radio is broadcasting");
             }
         }));
     }
@@ -140,7 +140,7 @@ fn on_tasks() -> Vec<Task> {
         }
     }));
     t.push(Box::new(|c| {
-        push(c, format!("→ ap0 {SUBNET}.1/24 + DHCP + firewall + NAT…"));
+        push(c, format!("→ plumbing: dhcp + firewall + NAT ⇢ SIM…"));
         let _ = run(&format!("sudo ip addr replace {SUBNET}.1/24 dev ap0"));
         let _ = run("sudo sysctl -q -w net.ipv4.ip_forward=1");
         // UFW: routed traffic (forward) + incoming DHCP broadcasts
@@ -155,8 +155,8 @@ fn on_tasks() -> Vec<Task> {
             state_dir().display(), state_dir().display()));
         if !ok { push(c, format!("✗ dnsmasq: {}", out.trim())); c.fail = true; return; }
         let s = poll();
-        push(c, format!("✓ hotspot ON — {SSID}/{PASS} — clients {SUBNET}.50-200 via {}",
-            if s.wwan { "SIM (CMCC)" } else { "default route" }));
+        push(c, format!("✓ ONLINE  phone ⇐ ap0 ⇐ NAT ⇐ {}   (pool {SUBNET}.50-200)",
+            if s.wwan { "CMCC" } else { "default route" }));
     }));
     t
 }
@@ -164,7 +164,7 @@ fn on_tasks() -> Vec<Task> {
 fn off_tasks(restore_wifi: bool) -> Vec<Task> {
     let mut t: Vec<Task> = Vec::new();
     t.push(Box::new(|c| {
-        push(c, "→ stopping AP services…");
+        push(c, "→ role: BASE STATION ⇒ client · silencing radio…");
         let _ = run(&format!("sudo kill $(cat {}/hostapd.pid) 2>/dev/null", state_dir().display()));
         let _ = run("sudo pkill -f 'hostapd .*hotspot/hostapd.conf' 2>/dev/null");
         let _ = run(&format!("sudo kill $(cat {}/dnsmasq.pid) 2>/dev/null", state_dir().display()));
@@ -190,14 +190,14 @@ fn off_tasks(restore_wifi: bool) -> Vec<Task> {
             std::thread::sleep(std::time::Duration::from_millis(1500));
             let _ = run("nmcli radio wifi on");
             std::thread::sleep(std::time::Duration::from_millis(2500));
-            push(c, "→ restoring WiFi…");
+            push(c, "→ rejoining WiFi (client hat back on)…");
             for cname in ["lap2.4", "lap"] {
                 let (ok, _) = run(&format!("nmcli connection up '{cname}'"));
                 if ok { push(c, format!("✓ {cname} reconnected")); }
             }
         }));
     }
-    t.push(Box::new(|c| push(c, "✓ hotspot OFF")));
+    t.push(Box::new(|c| push(c, "✓ client mode restored")));
     t
 }
 
@@ -213,36 +213,81 @@ struct App {
 fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(5), Constraint::Length(1)])
+        .constraints([Constraint::Length(9), Constraint::Min(5), Constraint::Length(1)])
         .split(f.area());
     let s = &app.st;
     let busy = !app.queue.is_empty();
-    let badge = if s.on {
-        Span::styled(" HOTSPOT ON ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))
-    } else {
-        Span::styled(" HOTSPOT OFF ", Style::default().fg(Color::Black).bg(Color::Red).add_modifier(Modifier::BOLD))
-    };
+
+    let dot_on = Style::default().fg(Color::Green);
+    let dot_off = Style::default().fg(Color::DarkGray);
     let dim = Style::default().fg(Color::DarkGray);
-    let lines = vec![
-        Line::from(vec![badge,
-            Span::styled(if busy { "  working…" } else { "" }, Style::default().fg(Color::Yellow)),
-            Span::raw("  "),
-            Span::styled(format!("default route: {}", if s.default_via.is_empty() { "none".into() } else { s.default_via.clone() }),
-                Style::default().fg(if s.default_via.contains("wwp") { Color::Green } else { Color::Yellow }))]),
-        Line::from(vec![Span::styled(format!("SSID    {SSID}  ({PASS})  2.4GHz ch{CHANNEL}"), dim)]),
-        Line::from(vec![Span::styled("Clients ", dim),
-            Span::styled(s.clients.to_string(), Style::default().fg(Color::Cyan)),
-            Span::raw("    "),
-            Span::styled("WiFi ", dim), Span::raw(if s.wifi { "connected" } else { "down" }),
-            Span::raw("    "),
-            Span::styled("SIM ", dim), Span::raw(if s.wwan { "CMCC" } else { "down" })]),
-        Line::from(vec![Span::styled("AP pool 10.66.66.50-200  gateway .1  dns 223.5.5.5", dim)]),
+    let link = |c: &'static str| Span::styled(c, dim);
+
+    let badge = if s.on {
+        Span::styled(" ⦿ BASE STATION ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" ○ CLIENT ", Style::default().fg(Color::Black).bg(Color::Blue).add_modifier(Modifier::BOLD))
+    };
+
+    // role line: the radio can wear exactly one hat at a time
+    let role = vec![
+        Span::styled("role    ", dim),
+        Span::styled(if s.on { "client ○" } else { "client ⦿" }, if s.on { dot_off } else { dot_on }),
+        link(" ──── ⌁ radio ⌁ ────"),
+        Span::styled(if s.on { " base-station ⦿" } else { " base-station ○" }, if s.on { dot_on } else { dot_off }),
+        if busy { Span::styled("   …switching", Style::default().fg(Color::Yellow)) } else { Span::raw("") },
     ];
-    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Status ")), chunks[0]);
+
+    // uplink line: who carries whose traffic right now
+    let uplink = if s.on {
+        let ap = Span::styled(if s.on { "⦿" } else { "○" }, dot_on);
+        let nat = Span::styled("⦿", dot_on);
+        let sim = Span::styled(if s.wwan { "⦿" } else { "○" }, if s.wwan { dot_on } else { dot_off });
+        let net = Span::styled(if s.wwan { "⦿" } else { "○" }, if s.wwan { dot_on } else { dot_off });
+        vec![
+            Span::styled("uplink  ", dim),
+            Span::styled("phone", Style::default().fg(Color::Cyan)), link(" ─"), ap.clone(), link(" ap0 ─"),
+            nat, link(" NAT ─"),
+            Span::styled("SIM", Style::default().fg(Color::Cyan)), link("("), Span::styled(if s.wwan { "CMCC LTE" } else { "no network" }, dim), link(") ─"),
+            sim, link(" internet "), net,
+        ]
+    } else {
+        let w = Span::styled(if s.wifi { "⦿" } else { "○" }, if s.wifi { dot_on } else { dot_off });
+        let sim = Span::styled("○", dot_off);
+        vec![
+            Span::styled("uplink  ", dim),
+            Span::styled("laptop", Style::default().fg(Color::Cyan)), link(" ─"), w, link(" WiFi(lap*) ─ internet"),
+            Span::raw("      "),
+            Span::styled("SIM idle ", dim), sim,
+        ]
+    };
+
+    let info = vec![
+        Span::styled("when AP ", dim),
+        Span::raw(format!("X1C / x1carbon123 · ch6 · pool {SUBNET}.50-200 · gw .1 · dns 223.5.5.5")),
+    ];
+    let clients = vec![
+        Span::styled("clients ", dim),
+        Span::styled(s.clients.to_string(), Style::default().fg(Color::Cyan)),
+        Span::raw("    "),
+        Span::styled(format!("default route: {}", if s.default_via.is_empty() { "none" } else { s.default_via.as_str() }), dim),
+    ];
+
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![badge]),
+            Line::from(role),
+            Line::from(uplink),
+            Line::from(info),
+            Line::from(clients),
+        ])
+        .block(Block::bordered().title(" Status · a radio wears one hat at a time ")),
+        chunks[0],
+    );
     let tail: Vec<Line> = app.ctx.log.iter().rev().take(40).rev().cloned().map(Line::from).collect();
     f.render_widget(Paragraph::new(tail).block(Block::bordered().title(" Log ")), chunks[1]);
     f.render_widget(
-        Paragraph::new("s start (drops WiFi, shares SIM) · x stop (restores WiFi) · q quit")
+        Paragraph::new("s ⇒ base-station (share SIM, WiFi off) · x ⇒ client (rejoin WiFi) · q quit")
             .style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
@@ -316,11 +361,11 @@ fn main() {
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                     KeyCode::Char('s') if !app.st.on => {
-                        app.ctx.log.push("── start requested ──".into());
+                        app.ctx.log.push("── switch: client ⇒ BASE STATION ──".into());
                         for t in on_tasks() { app.queue.push_back(t); }
                     }
                     KeyCode::Char('x') if app.st.on => {
-                        app.ctx.log.push("── stop requested ──".into());
+                        app.ctx.log.push("── switch: BASE STATION ⇒ client ──".into());
                         for t in off_tasks(true) { app.queue.push_back(t); }
                     }
                     _ => {}
