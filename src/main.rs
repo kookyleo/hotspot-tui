@@ -83,8 +83,23 @@ fn on_tasks() -> Vec<Task> {
         let _ = run(&format!("nmcli device set {wlan} managed no"));
     }));
     t.push(Box::new(|c| {
-        push(c, "· waiting for supplicant cleanup (2.5s)…");
-        std::thread::sleep(std::time::Duration::from_millis(2500));
+        push(c, "· waiting for supplicant cleanup (1.5s)…");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }));
+    // Firmware-level reset: iwlmvm leaks the AP context on teardown
+    // ("Match already configured" on every later start); only a driver
+    // reload clears it. rfkill cycling is NOT enough.
+    t.push(Box::new(|c| {
+        push(c, "→ resetting wifi driver (clears iwlmvm AP context)…");
+        let _ = run("nmcli radio wifi off");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let _ = run("sudo modprobe -r iwlmvm iwlwifi 2>/dev/null || sudo rmmod iwlmvm iwlwifi 2>/dev/null || true");
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let _ = run("sudo modprobe iwlwifi");
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        let wlan = wifi_dev();
+        let _ = run(&format!("nmcli device set {wlan} managed no"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }));
     t.push(Box::new(|c| {
         push(c, "→ creating AP interface ap0…");
@@ -235,7 +250,19 @@ fn draw(f: &mut Frame, app: &App) {
 
 fn drain(tasks: Vec<Task>, log: &mut Vec<String>) {
     let mut ctx = Ctx { log: std::mem::take(log), fail: false };
-    for t in tasks { t(&mut ctx); }
+    let mut tasks = tasks.into_iter();
+    loop {
+        match tasks.next() {
+            Some(t) if !ctx.fail => t(&mut ctx),
+            None if !ctx.fail => break,
+            _ => {
+                ctx.log.push("✗ aborted — rolling back".into());
+                ctx.fail = false;
+                for t in off_tasks(true) { t(&mut ctx); }
+                break;
+            }
+        }
+    }
     *log = ctx.log;
 }
 
