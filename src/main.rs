@@ -89,11 +89,13 @@ fn hostapd_conf() -> String {
 
 fn on(log: &mut Vec<String>) {
     let wlan = wifi_dev();
-    log.push(format!("→ disconnecting WiFi ({wlan}) — iwlwifi single-channel constraint"));
+    log.push(format!("→ releasing WiFi ({wlan}) from NetworkManager — AP needs the phy alone"));
     let _ = run("nmcli connection down hotspot 2>/dev/null");
-    let _ = run(&format!("nmcli device disconnect {wlan}"));
-    let _ = run(&format!("nmcli device set {wlan} managed no")); // NM off our back
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    // NOTE: `device disconnect` before AP bring-up leaves iwlmvm firmware
+    // state that breaks AP context creation ("Match already configured").
+    // `managed no` lets NM/wpa_supplicant clean up properly instead.
+    let _ = run(&format!("nmcli device set {wlan} managed no"));
+    std::thread::sleep(std::time::Duration::from_millis(2500));
 
     log.push("→ creating AP interface ap0…".into());
     if !ap_exists() {
@@ -104,8 +106,19 @@ fn on(log: &mut Vec<String>) {
 
     fs::write(state_dir().join("hostapd.conf"), hostapd_conf()).ok();
     log.push(format!("→ starting hostapd (2.4GHz ch{CHANNEL}, ssid {SSID})…"));
-    let (ok, out) = run(&format!("sudo hostapd -B -P {}/hostapd.pid {}/hostapd.conf", state_dir().display(), state_dir().display()));
-    if !ok || !hostapd_running() {
+    // cfg80211 keeps tearing down the client-mode regulatory state after the
+    // WiFi disconnect; starting too early fails with `Match already configured`.
+    let mut ok = false;
+    let mut out = String::new();
+    for attempt in 1..=4 {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let r = run(&format!("sudo hostapd -B -P {}/hostapd.pid {}/hostapd.conf", state_dir().display(), state_dir().display()));
+        ok = r.0 && hostapd_running();
+        out = r.1;
+        if ok { break; }
+        log.push(format!("· hostapd attempt {attempt} failed, retrying… ({})", out.lines().next().unwrap_or("")));
+    }
+    if !ok {
         log.push(format!("✗ hostapd failed: {}", out.trim()));
         off(log, true);
         return;
@@ -114,6 +127,9 @@ fn on(log: &mut Vec<String>) {
     log.push(format!("→ ap0 {SUBNET}.1/24 + DHCP + NAT via SIM…"));
     let _ = run(&format!("sudo ip addr replace {SUBNET}.1/24 dev ap0"));
     let _ = run("sudo sysctl -q -w net.ipv4.ip_forward=1");
+    // UFW defaults to `deny (routed)`: forwarded hotspot traffic needs an
+    // explicit route rule or everything is silently dropped.
+    let _ = run("sudo ufw route allow in on ap0 comment hotspot-tui 2>/dev/null || sudo ufw route allow in on ap0");
     let _ = run("sudo iptables -t nat -A POSTROUTING -s 10.66.66.0/24 ! -o ap0 -j MASQUERADE");
     let _ = run("sudo iptables -A FORWARD -i ap0 -j ACCEPT");
     let _ = run("sudo iptables -A FORWARD -o ap0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT");
@@ -136,6 +152,7 @@ fn off(log: &mut Vec<String>, wifi_restore: bool) {
     let _ = run(&format!("sudo kill $(cat {}/hostapd.pid) 2>/dev/null", state_dir().display()));
     let _ = run("sudo pkill -f 'hostapd .*hotspot/hostapd.conf' 2>/dev/null");
     let _ = run(&format!("sudo kill $(cat {}/dnsmasq.pid) 2>/dev/null", state_dir().display()));
+    let _ = run("sudo ufw route delete allow in on ap0 comment hotspot-tui 2>/dev/null; sudo ufw route delete allow in on ap0 2>/dev/null");
     let _ = run("sudo iptables -t nat -D POSTROUTING -s 10.66.66.0/24 ! -o ap0 -j MASQUERADE 2>/dev/null");
     let _ = run("sudo iptables -D FORWARD -i ap0 -j ACCEPT 2>/dev/null");
     let _ = run("sudo iptables -D FORWARD -o ap0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null");
