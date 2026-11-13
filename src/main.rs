@@ -27,10 +27,10 @@ const SUBNET: &str = "10.66.66";
 
 // ---------------- config ----------------
 #[derive(Clone)]
-struct Cfg { ssid: String, pass: String, channel: String, subnet: String }
+struct Cfg { ssid: String, pass: String, channel: String, subnet: String, client_dns: String }
 impl Default for Cfg {
     fn default() -> Self {
-        Cfg { ssid: SSID.into(), pass: PASS.into(), channel: CHANNEL.into(), subnet: SUBNET.into() }
+        Cfg { ssid: SSID.into(), pass: PASS.into(), channel: CHANNEL.into(), subnet: SUBNET.into(), client_dns: "223.5.5.5".into() }
     }
 }
 fn cfg_path() -> PathBuf {
@@ -51,6 +51,7 @@ fn cfg_load() -> Cfg {
                     "password" => c.pass = v.trim().to_string(),
                     "channel" => c.channel = v.trim().to_string(),
                     "subnet" => c.subnet = v.trim().to_string(),
+                    "client_dns" => c.client_dns = v.trim().to_string(),
                     _ => {}
                 }
             }
@@ -59,7 +60,7 @@ fn cfg_load() -> Cfg {
     c
 }
 fn cfg_save(c: &Cfg) -> std::io::Result<()> {
-    fs::write(cfg_path(), format!("ssid={}\npassword={}\nchannel={}\nsubnet={}\n", c.ssid, c.pass, c.channel, c.subnet))
+    fs::write(cfg_path(), format!("ssid={}\npassword={}\nchannel={}\nsubnet={}\nclient_dns={}\n", c.ssid, c.pass, c.channel, c.subnet, c.client_dns))
 }
 
 fn run(cmd: &str) -> (bool, String) {
@@ -195,8 +196,9 @@ fn on_tasks(cfg: &Cfg) -> Vec<Task> {
         let (ok, out) = run(&format!(
             "sudo dnsmasq --interface=ap0 --bind-interfaces --port=0 \
              --dhcp-range={subnet}.50,{subnet}.200,255.255.255.0,12h \
-             --dhcp-option=6,223.5.5.5 --dhcp-option=3,{subnet}.1 \
+             --dhcp-option=6,{} --dhcp-option=3,{subnet}.1 \
              --pid-file={}/dnsmasq.pid --log-facility={}/dnsmasq.log",
+            cfg.client_dns,
             state_dir().display(), state_dir().display()));
         if !ok { push(c, format!("✗ dnsmasq: {}", out.trim())); c.fail = true; return; }
         let s = poll();
@@ -270,18 +272,23 @@ fn validate_field(i: usize, v: &str) -> Result<(), String> {
         0 => { if v.is_empty() || v.chars().count() > 32 { Err("ssid needs 1–32 chars".into()) } else { Ok(()) } }
         1 => { let n = v.chars().count(); if (8..=63).contains(&n) { Ok(()) } else { Err(format!("WPA passphrase needs 8–63 chars, got {n}")) } }
         2 => { match v.parse::<u32>() { Ok(c) if (1..=13).contains(&c) => Ok(()), _ => Err("channel: 1–13 (2.4GHz)".into()) } }
-        _ => { let p: Vec<&str> = v.split('.').collect();
+        3 => { let p: Vec<&str> = v.split('.').collect();
                if p.len() == 3 && p.iter().all(|o| o.parse::<u8>().is_ok()) { Ok(()) } else { Err("subnet: three octets, e.g. 10.66.66".into()) } }
+        _ => { let parts: Vec<&str> = v.split(',').map(str::trim).collect();
+               let ok = !parts.is_empty() && parts.len() <= 2 && parts.iter().all(|ip| {
+                   let o: Vec<&str> = ip.split('.').collect();
+                   o.len() == 4 && o.iter().all(|x| x.parse::<u8>().is_ok()) });
+               if ok { Ok(()) } else { Err("dns: one or two IPv4 addresses, e.g. 223.5.5.5 or 223.5.5.5,119.29.29.29".into()) } }
     }
 }
 
 fn field_get(c: &Cfg, i: usize) -> String {
-    match i { 0 => c.ssid.clone(), 1 => c.pass.clone(), 2 => c.channel.clone(), _ => c.subnet.clone() }
+    match i { 0 => c.ssid.clone(), 1 => c.pass.clone(), 2 => c.channel.clone(), 3 => c.subnet.clone(), _ => c.client_dns.clone() }
 }
 fn field_set(c: &mut Cfg, i: usize, v: String) {
-    match i { 0 => c.ssid = v, 1 => c.pass = v, 2 => c.channel = v, _ => c.subnet = v }
+    match i { 0 => c.ssid = v, 1 => c.pass = v, 2 => c.channel = v, 3 => c.subnet = v, _ => c.client_dns = v }
 }
-const FIELDS: [&str; 4] = ["ssid", "password", "channel", "subnet"];
+const FIELDS: [&str; 5] = ["ssid", "password", "channel", "subnet", "client_dns"];
 
 fn centered(r: ratatui::layout::Rect, w: u16, h: u16) -> ratatui::layout::Rect {
     let w = w.min(r.width.saturating_sub(2));
@@ -348,7 +355,7 @@ fn draw(f: &mut Frame, app: &App) {
 
     let info = vec![
         Span::styled("when AP ", dim),
-        Span::raw(format!("{} / {} · ch{} · pool {}.50-200 · gw .1 · dns 223.5.5.5", app.cfg.ssid, app.cfg.pass, app.cfg.channel, app.cfg.subnet)),
+        Span::raw(format!("{} / {} · ch{} · pool {}.50-200 · gw .1 · dns {}", app.cfg.ssid, app.cfg.pass, app.cfg.channel, app.cfg.subnet, app.cfg.client_dns)),
     ];
     let clients = vec![
         Span::styled("clients ", dim),
@@ -377,7 +384,7 @@ fn draw(f: &mut Frame, app: &App) {
     );
 
     if app.pop {
-        let area = centered(chunks[1], 58, 10);
+        let area = centered(chunks[1], 58, 11);
         f.render_widget(ratatui::widgets::Clear, area);
         let mut lines: Vec<Line> = Vec::new();
         for (i, name) in FIELDS.iter().enumerate() {
@@ -495,7 +502,7 @@ fn main() {
                         (true, KeyCode::Backspace) => { app.pop_buf.pop(); }
                         (true, KeyCode::Char(ch)) => app.pop_buf.push(ch),
                         (false, KeyCode::Esc) => app.pop = false,
-                        (false, KeyCode::Down) | (false, KeyCode::Char('j')) => app.pop_sel = (app.pop_sel + 1) % 4,
+                        (false, KeyCode::Down) | (false, KeyCode::Char('j')) => app.pop_sel = (app.pop_sel + 1) % FIELDS.len(),
                         (false, KeyCode::Up) | (false, KeyCode::Char('k')) => app.pop_sel = app.pop_sel.saturating_sub(1),
                         (false, KeyCode::Enter) => {
                             app.pop_buf = field_get(&app.cfg, app.pop_sel);
