@@ -213,6 +213,9 @@ fn off_tasks(restore_wifi: bool) -> Vec<Task> {
         let _ = run(&format!("sudo kill $(cat {}/hostapd.pid) 2>/dev/null", state_dir().display()));
         let _ = run("sudo pkill -f 'hostapd .*hotspot/hostapd.conf' 2>/dev/null");
         let _ = run(&format!("sudo kill $(cat {}/dnsmasq.pid) 2>/dev/null", state_dir().display()));
+        // pidfile can be overwritten by a fast off/on cycle, orphaning the
+        // old dnsmasq (two servers then answer the same DISCOVER) — sweep by pattern too.
+        let _ = run("sudo pkill -f 'dnsmasq .*hotspot/dnsmasq.pid' 2>/dev/null || true");
     }));
     t.push(Box::new(|c| {
         push(c, "→ removing firewall rules + ap0…");
