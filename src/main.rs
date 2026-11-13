@@ -162,6 +162,12 @@ fn on_tasks(cfg: &Cfg) -> Vec<Task> {
             if !hostapd_running() {
                 let why = out.lines().find(|l| l.contains("reports") || l.contains("failed") || l.contains("Could not"))
                     .or_else(|| out.lines().next()).unwrap_or("");
+                // config-level errors are deterministic — retrying is pointless
+                if out.contains("Line") && (out.contains("invalid") || out.contains("unknown")) {
+                    push(c, format!("✗ hostapd rejected config: {why}"));
+                    c.fail = true;
+                    return;
+                }
                 push(c, format!("· attempt {i} failed: {why}"));
                 let _ = run("sudo pkill -f 'hostapd .*hotspot/hostapd.conf' 2>/dev/null");
                 std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -253,6 +259,17 @@ struct App {
     pop_sel: usize,
     pop_edit: bool,
     pop_buf: String,
+}
+
+
+fn validate_field(i: usize, v: &str) -> Result<(), String> {
+    match i {
+        0 => { if v.is_empty() || v.chars().count() > 32 { Err("ssid needs 1–32 chars".into()) } else { Ok(()) } }
+        1 => { let n = v.chars().count(); if (8..=63).contains(&n) { Ok(()) } else { Err(format!("WPA passphrase needs 8–63 chars, got {n}")) } }
+        2 => { match v.parse::<u32>() { Ok(c) if (1..=13).contains(&c) => Ok(()), _ => Err("channel: 1–13 (2.4GHz)".into()) } }
+        _ => { let p: Vec<&str> = v.split('.').collect();
+               if p.len() == 3 && p.iter().all(|o| o.parse::<u8>().is_ok()) { Ok(()) } else { Err("subnet: three octets, e.g. 10.66.66".into()) } }
+    }
 }
 
 fn field_get(c: &Cfg, i: usize) -> String {
@@ -461,13 +478,16 @@ fn main() {
                     match (app.pop_edit, k.code) {
                         (true, KeyCode::Esc) => { app.pop_edit = false; }
                         (true, KeyCode::Enter) => {
-                            let v = std::mem::take(&mut app.pop_buf);
-                            if !v.trim().is_empty() && v.len() < 64 {
-                                field_set(&mut app.cfg, app.pop_sel, v.trim().to_string());
-                                let _ = cfg_save(&app.cfg);
-                                app.ctx.log.push(format!("✓ config saved: {} = {}", FIELDS[app.pop_sel], field_get(&app.cfg, app.pop_sel)));
+                            let v = app.pop_buf.trim().to_string();
+                            match validate_field(app.pop_sel, &v) {
+                                Ok(()) => {
+                                    field_set(&mut app.cfg, app.pop_sel, v.clone());
+                                    let _ = cfg_save(&app.cfg);
+                                    app.ctx.log.push(format!("✓ config saved: {} = {}", FIELDS[app.pop_sel], v));
+                                    app.pop_edit = false;
+                                }
+                                Err(e) => app.ctx.log.push(format!("✗ invalid {}: {e}", FIELDS[app.pop_sel])),
                             }
-                            app.pop_edit = false;
                         }
                         (true, KeyCode::Backspace) => { app.pop_buf.pop(); }
                         (true, KeyCode::Char(ch)) => app.pop_buf.push(ch),
