@@ -130,6 +130,8 @@ fn on(log: &mut Vec<String>) {
     // UFW defaults to `deny (routed)`: forwarded hotspot traffic needs an
     // explicit route rule or everything is silently dropped.
     let _ = run("sudo ufw route allow in on ap0 comment hotspot-tui 2>/dev/null || sudo ufw route allow in on ap0");
+    // UFW default-deny-incoming also swallows DHCP broadcasts to dnsmasq.
+    let _ = run("sudo ufw allow in on ap0 to any port 67,68 proto udp comment hotspot-tui 2>/dev/null || true");
     let _ = run("sudo iptables -t nat -A POSTROUTING -s 10.66.66.0/24 ! -o ap0 -j MASQUERADE");
     let _ = run("sudo iptables -A FORWARD -i ap0 -j ACCEPT");
     let _ = run("sudo iptables -A FORWARD -o ap0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT");
@@ -153,6 +155,7 @@ fn off(log: &mut Vec<String>, wifi_restore: bool) {
     let _ = run("sudo pkill -f 'hostapd .*hotspot/hostapd.conf' 2>/dev/null");
     let _ = run(&format!("sudo kill $(cat {}/dnsmasq.pid) 2>/dev/null", state_dir().display()));
     let _ = run("sudo ufw route delete allow in on ap0 comment hotspot-tui 2>/dev/null; sudo ufw route delete allow in on ap0 2>/dev/null");
+    let _ = run("sudo ufw delete allow in on ap0 to any port 67,68 proto udp comment hotspot-tui 2>/dev/null || true");
     let _ = run("sudo iptables -t nat -D POSTROUTING -s 10.66.66.0/24 ! -o ap0 -j MASQUERADE 2>/dev/null");
     let _ = run("sudo iptables -D FORWARD -i ap0 -j ACCEPT 2>/dev/null");
     let _ = run("sudo iptables -D FORWARD -o ap0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null");
