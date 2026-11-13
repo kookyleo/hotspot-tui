@@ -24,6 +24,44 @@ const PASS: &str = "x1carbon123";
 const CHANNEL: &str = "6"; // 2.4GHz (see README)
 const SUBNET: &str = "10.66.66";
 
+
+// ---------------- config ----------------
+#[derive(Clone)]
+struct Cfg { ssid: String, pass: String, channel: String, subnet: String }
+impl Default for Cfg {
+    fn default() -> Self {
+        Cfg { ssid: SSID.into(), pass: PASS.into(), channel: CHANNEL.into(), subnet: SUBNET.into() }
+    }
+}
+fn cfg_path() -> PathBuf {
+    let p = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("{}/.config", std::env::var("HOME").unwrap_or("/tmp".into()))))
+        .join("hotspot");
+    fs::create_dir_all(&p).ok();
+    p.join("config")
+}
+fn cfg_load() -> Cfg {
+    let mut c = Cfg::default();
+    if let Ok(txt) = fs::read_to_string(cfg_path()) {
+        for l in txt.lines() {
+            if let Some((k, v)) = l.split_once('=') {
+                match k.trim() {
+                    "ssid" => c.ssid = v.trim().to_string(),
+                    "password" => c.pass = v.trim().to_string(),
+                    "channel" => c.channel = v.trim().to_string(),
+                    "subnet" => c.subnet = v.trim().to_string(),
+                    _ => {}
+                }
+            }
+        }
+    }
+    c
+}
+fn cfg_save(c: &Cfg) -> std::io::Result<()> {
+    fs::write(cfg_path(), format!("ssid={}\npassword={}\nchannel={}\nsubnet={}\n", c.ssid, c.pass, c.channel, c.subnet))
+}
+
 fn run(cmd: &str) -> (bool, String) {
     match Command::new("sh").arg("-c").arg(cmd).output() {
         Ok(o) => (
@@ -74,7 +112,7 @@ type Task = Box<dyn FnOnce(&mut Ctx)>;
 
 fn push(ctx: &mut Ctx, s: impl Into<String>) { ctx.log.push(s.into()); }
 
-fn on_tasks() -> Vec<Task> {
+fn on_tasks(cfg: &Cfg) -> Vec<Task> {
     let mut t: Vec<Task> = Vec::new();
     t.push(Box::new(|c| {
         push(c, format!("→ role: client ⇒ BASE STATION · releasing phy ({}) from NM…", wifi_dev()));
@@ -109,17 +147,16 @@ fn on_tasks() -> Vec<Task> {
         }
         let _ = run("sudo ip link set ap0 up");
     }));
-    t.push(Box::new(|_c| {
-        let conf = format!(
-            "interface=ap0\ndriver=nl80211\nssid={SSID}\nhw_mode=g\nchannel={CHANNEL}\nwpa=2\nwpa_passphrase={PASS}\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nauth_algs=1\nieee80211n=1\nwmm_enabled=1\nignore_broadcast_ssid=0\n"
-        );
-        fs::write(state_dir().join("hostapd.conf"), conf).ok();
-    }));
     // up to 4 hostapd attempts, each its own visual step
     for i in 1..=4u8 {
+        let cfg = cfg.clone();
         t.push(Box::new(move |c| {
             if hostapd_running() { return; }
-            push(c, format!("→ ⌁ broadcasting X1C on ch{CHANNEL}… attempt {i}"));
+            push(c, format!("→ ⌁ broadcasting {} on ch{}… attempt {i}", cfg.ssid, cfg.channel));
+            let conf = format!(
+                "interface=ap0\ndriver=nl80211\nssid={}\nhw_mode=g\nchannel={}\nwpa=2\nwpa_passphrase={}\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\nauth_algs=1\nieee80211n=1\nwmm_enabled=1\nignore_broadcast_ssid=0\n",
+                cfg.ssid, cfg.channel, cfg.pass);
+            fs::write(state_dir().join("hostapd.conf"), conf).ok();
             let (_, out) = run(&format!("sudo hostapd -B -P {}/hostapd.pid {}/hostapd.conf", state_dir().display(), state_dir().display()));
             std::thread::sleep(std::time::Duration::from_millis(1200));
             if !hostapd_running() {
@@ -139,23 +176,25 @@ fn on_tasks() -> Vec<Task> {
             c.fail = true;
         }
     }));
-    t.push(Box::new(|c| {
+    let cfg = cfg.clone();
+    t.push(Box::new(move |c| {
+        let subnet = cfg.subnet.clone();
         push(c, format!("→ plumbing: dhcp + firewall + NAT ⇢ SIM…"));
-        let _ = run(&format!("sudo ip addr replace {SUBNET}.1/24 dev ap0"));
+        let _ = run(&format!("sudo ip addr replace {subnet}.1/24 dev ap0"));
         let _ = run("sudo sysctl -q -w net.ipv4.ip_forward=1");
         // UFW: routed traffic (forward) + incoming DHCP broadcasts
         let _ = run("sudo ufw route allow in on ap0 comment hotspot-tui 2>/dev/null || true");
         let _ = run("sudo ufw allow in on ap0 to any port 67,68 proto udp comment hotspot-tui 2>/dev/null || true");
-        let _ = run("sudo iptables -t nat -C POSTROUTING -s 10.66.66.0/24 ! -o ap0 -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s 10.66.66.0/24 ! -o ap0 -j MASQUERADE");
+        let _ = run(&format!("sudo iptables -t nat -C POSTROUTING -s {subnet}.0/24 ! -o ap0 -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -s {subnet}.0/24 ! -o ap0 -j MASQUERADE"));
         let (ok, out) = run(&format!(
             "sudo dnsmasq --interface=ap0 --bind-interfaces --port=0 \
-             --dhcp-range={SUBNET}.50,{SUBNET}.200,255.255.255.0,12h \
-             --dhcp-option=6,223.5.5.5 --dhcp-option=3,{SUBNET}.1 \
+             --dhcp-range={subnet}.50,{subnet}.200,255.255.255.0,12h \
+             --dhcp-option=6,223.5.5.5 --dhcp-option=3,{subnet}.1 \
              --pid-file={}/dnsmasq.pid --log-facility={}/dnsmasq.log",
             state_dir().display(), state_dir().display()));
         if !ok { push(c, format!("✗ dnsmasq: {}", out.trim())); c.fail = true; return; }
         let s = poll();
-        push(c, format!("✓ ONLINE  phone ⇐ ap0 ⇐ NAT ⇐ {}   (pool {SUBNET}.50-200)",
+        push(c, format!("✓ ONLINE  phone ⇐ ap0 ⇐ NAT ⇐ {}   (pool {subnet}.50-200)",
             if s.wwan { "CMCC" } else { "default route" }));
     }));
     t
@@ -173,7 +212,8 @@ fn off_tasks(restore_wifi: bool) -> Vec<Task> {
         push(c, "→ removing firewall rules + ap0…");
         let _ = run("sudo ufw route delete allow in on ap0 comment hotspot-tui 2>/dev/null || true");
         let _ = run("sudo ufw delete allow in on ap0 to any port 67,68 proto udp comment hotspot-tui 2>/dev/null || true");
-        let _ = run("sudo iptables -t nat -D POSTROUTING -s 10.66.66.0/24 ! -o ap0 -j MASQUERADE 2>/dev/null || true");
+        let cfg = cfg_load();
+        let _ = run(&format!("sudo iptables -t nat -D POSTROUTING -s {}.0/24 ! -o ap0 -j MASQUERADE 2>/dev/null || true", cfg.subnet));
         let _ = run("sudo iptables -D FORWARD -i ap0 -j ACCEPT 2>/dev/null || true");
         let _ = run("sudo iptables -D FORWARD -o ap0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true");
         let _ = run("sudo iw dev ap0 del 2>/dev/null || true");
@@ -208,6 +248,30 @@ struct App {
     ctx: Ctx,
     queue: VecDeque<Task>,
     quit: bool,
+    cfg: Cfg,
+    pop: bool,
+    pop_sel: usize,
+    pop_edit: bool,
+    pop_buf: String,
+}
+
+fn field_get(c: &Cfg, i: usize) -> String {
+    match i { 0 => c.ssid.clone(), 1 => c.pass.clone(), 2 => c.channel.clone(), _ => c.subnet.clone() }
+}
+fn field_set(c: &mut Cfg, i: usize, v: String) {
+    match i { 0 => c.ssid = v, 1 => c.pass = v, 2 => c.channel = v, _ => c.subnet = v }
+}
+const FIELDS: [&str; 4] = ["ssid", "password", "channel", "subnet"];
+
+fn centered(r: ratatui::layout::Rect, w: u16, h: u16) -> ratatui::layout::Rect {
+    let w = w.min(r.width.saturating_sub(2));
+    let h = h.min(r.height.saturating_sub(2));
+    ratatui::layout::Rect {
+        x: r.x + (r.width.saturating_sub(w)) / 2,
+        y: r.y + (r.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -264,7 +328,7 @@ fn draw(f: &mut Frame, app: &App) {
 
     let info = vec![
         Span::styled("when AP ", dim),
-        Span::raw(format!("X1C / x1carbon123 · ch6 · pool {SUBNET}.50-200 · gw .1 · dns 223.5.5.5")),
+        Span::raw(format!("{} / {} · ch{} · pool {}.50-200 · gw .1 · dns 223.5.5.5", app.cfg.ssid, app.cfg.pass, app.cfg.channel, app.cfg.subnet)),
     ];
     let clients = vec![
         Span::styled("clients ", dim),
@@ -287,15 +351,45 @@ fn draw(f: &mut Frame, app: &App) {
     let tail: Vec<Line> = app.ctx.log.iter().rev().take(40).rev().cloned().map(Line::from).collect();
     f.render_widget(Paragraph::new(tail).block(Block::bordered().title(" Log ")), chunks[1]);
     f.render_widget(
-        Paragraph::new("s ⇒ base-station (share SIM, WiFi off) · x ⇒ client (rejoin WiFi) · q quit")
+        Paragraph::new("s ⇒ base-station · x ⇒ client · c config · q quit")
             .style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
+
+    if app.pop {
+        let area = centered(chunks[1], 58, 10);
+        f.render_widget(ratatui::widgets::Clear, area);
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, name) in FIELDS.iter().enumerate() {
+            let val = if app.pop_edit && i == app.pop_sel { app.pop_buf.clone() } else { field_get(&app.cfg, i) };
+            let sty = if i == app.pop_sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(format!(" {name:<9}= {val}"), sty)));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if app.pop_edit { "Enter commit · Esc abort" } else { "↑↓ field · Enter edit · Esc close (saved on edit)" },
+            Style::default().fg(Color::DarkGray),
+        )));
+        let block = Block::bordered()
+            .title(format!(" Config  {} ", cfg_path().display()))
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(Paragraph::new(lines), inner);
+        if app.pop_edit {
+            let x = inner.x + 1 + (FIELDS[app.pop_sel].len() as u16 + 4 + app.pop_buf.chars().count() as u16).min(inner.width.saturating_sub(2));
+            f.set_cursor_position((x, inner.y + app.pop_sel as u16));
+        }
+    }
 }
 
-fn drain(tasks: Vec<Task>, log: &mut Vec<String>) {
+fn drain(_tasks: Vec<Task>, log: &mut Vec<String>) {
     let mut ctx = Ctx { log: std::mem::take(log), fail: false };
-    let mut tasks = tasks.into_iter();
+    let mut tasks = _tasks.into_iter();
     loop {
         match tasks.next() {
             Some(t) if !ctx.fail => t(&mut ctx),
@@ -315,7 +409,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut log = Vec::new();
     match args.first().map(String::as_str) {
-        Some("--on") => { drain(on_tasks(), &mut log); log.iter().for_each(|l| println!("{l}")); return; }
+        Some("--on") => { drain(on_tasks(&cfg_load()), &mut log); log.iter().for_each(|l| println!("{l}")); return; }
         Some("--off") => { drain(off_tasks(true), &mut log); log.iter().for_each(|l| println!("{l}")); return; }
         Some("--status") => {
             let s = poll();
@@ -338,6 +432,11 @@ fn main() {
         ctx: Ctx { log: vec!["ready.".into()], fail: false },
         queue: VecDeque::new(),
         quit: false,
+        cfg: cfg_load(),
+        pop: false,
+        pop_sel: 0,
+        pop_edit: false,
+        pop_buf: String::new(),
     };
 
     while !app.quit {
@@ -358,11 +457,40 @@ fn main() {
         if event::poll(timeout).unwrap() {
             if let Event::Key(k) = event::read().unwrap() {
                 if k.kind != KeyEventKind::Press { continue; }
+                if app.pop {
+                    match (app.pop_edit, k.code) {
+                        (true, KeyCode::Esc) => { app.pop_edit = false; }
+                        (true, KeyCode::Enter) => {
+                            let v = std::mem::take(&mut app.pop_buf);
+                            if !v.trim().is_empty() && v.len() < 64 {
+                                field_set(&mut app.cfg, app.pop_sel, v.trim().to_string());
+                                let _ = cfg_save(&app.cfg);
+                                app.ctx.log.push(format!("✓ config saved: {} = {}", FIELDS[app.pop_sel], field_get(&app.cfg, app.pop_sel)));
+                            }
+                            app.pop_edit = false;
+                        }
+                        (true, KeyCode::Backspace) => { app.pop_buf.pop(); }
+                        (true, KeyCode::Char(ch)) => app.pop_buf.push(ch),
+                        (false, KeyCode::Esc) => app.pop = false,
+                        (false, KeyCode::Down) | (false, KeyCode::Char('j')) => app.pop_sel = (app.pop_sel + 1) % 4,
+                        (false, KeyCode::Up) | (false, KeyCode::Char('k')) => app.pop_sel = app.pop_sel.saturating_sub(1),
+                        (false, KeyCode::Enter) => {
+                            app.pop_buf = field_get(&app.cfg, app.pop_sel);
+                            app.pop_edit = true;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+                    KeyCode::Char('c') => {
+                        app.pop = true;
+                        app.pop_edit = false;
+                    }
                     KeyCode::Char('s') if !app.st.on => {
                         app.ctx.log.push("── switch: client ⇒ BASE STATION ──".into());
-                        for t in on_tasks() { app.queue.push_back(t); }
+                        for t in on_tasks(&app.cfg.clone()) { app.queue.push_back(t); }
                     }
                     KeyCode::Char('x') if app.st.on => {
                         app.ctx.log.push("── switch: BASE STATION ⇒ client ──".into());
