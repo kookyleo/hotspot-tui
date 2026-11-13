@@ -105,10 +105,12 @@ fn on_tasks() -> Vec<Task> {
         t.push(Box::new(move |c| {
             if hostapd_running() { return; }
             push(c, format!("→ starting hostapd (2.4GHz ch{CHANNEL}, ssid {SSID})… attempt {i}"));
-            let _ = run(&format!("sudo hostapd -B -P {}/hostapd.pid {}/hostapd.conf", state_dir().display(), state_dir().display()));
+            let (_, out) = run(&format!("sudo hostapd -B -P {}/hostapd.pid {}/hostapd.conf", state_dir().display(), state_dir().display()));
             std::thread::sleep(std::time::Duration::from_millis(1200));
             if !hostapd_running() {
-                push(c, "· not up yet, will retry…");
+                let why = out.lines().find(|l| l.contains("reports") || l.contains("failed") || l.contains("Could not"))
+                    .or_else(|| out.lines().next()).unwrap_or("");
+                push(c, format!("· attempt {i} failed: {why}"));
                 let _ = run("sudo pkill -f 'hostapd .*hotspot/hostapd.conf' 2>/dev/null");
                 std::thread::sleep(std::time::Duration::from_millis(1500));
             } else {
@@ -165,7 +167,14 @@ fn off_tasks(restore_wifi: bool) -> Vec<Task> {
     }));
     if restore_wifi {
         t.push(Box::new(|c| {
-            std::thread::sleep(std::time::Duration::from_millis(800));
+            // rfkill cycle resets iwlwifi firmware, releasing any leaked AP
+            // contexts — without this, a second start fails with
+            // `Match already configured`.
+            push(c, "→ resetting wifi radio…");
+            let _ = run("nmcli radio wifi off");
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let _ = run("nmcli radio wifi on");
+            std::thread::sleep(std::time::Duration::from_millis(2500));
             push(c, "→ restoring WiFi…");
             for cname in ["lap2.4", "lap"] {
                 let (ok, _) = run(&format!("nmcli connection up '{cname}'"));
@@ -266,8 +275,9 @@ fn main() {
             task(&mut app.ctx);
             if app.ctx.fail {
                 app.ctx.fail = false;
-                let rollback = off_tasks(true);
-                for t in rollback { app.queue.push_back(t); }
+                app.ctx.log.push("✗ aborted — rolling back".into());
+                app.queue.clear(); // don't run the rest of the failed sequence
+                for t in off_tasks(true) { app.queue.push_back(t); }
             }
             if app.queue.is_empty() { app.st = poll(); }
             continue;
